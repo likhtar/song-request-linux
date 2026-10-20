@@ -1,11 +1,10 @@
 use std::collections::HashSet;
 
 use anyhow::{anyhow, bail, Context, Result};
-use reqwest::Client;
 use serde::Deserialize;
 use tracing::debug;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, YoutubeConfig};
 
 const API_URL: &str = "https://www.googleapis.com/youtube/v3";
 const MUSIC_CATEGORY_ID: &str = "10";
@@ -85,28 +84,43 @@ pub async fn video_metadata(
     fetch_video_metadata(config, &video.video_id).await
 }
 
+/// Resolve a video's title and channel as a cheap (title, artist) pair for
+/// chat display. Uses the YouTube Data API metadata cached by callers.
+pub async fn video_title_artist(config: &AppConfig, video_id: &str) -> Option<(String, String)> {
+    let video = YoutubeVideoRef::parse(&format!("https://youtu.be/{video_id}"))?;
+    let metadata = video_metadata(config, &video).await.ok()?;
+    Some((metadata.title, metadata.channel_title))
+}
+
+/// Enforce the configured video policy (max duration + music category) on
+/// already-fetched metadata. Shared by the text-search flow and the direct
+/// link flow so a raw YouTube URL cannot bypass the limits.
+pub fn enforce_video_policy(config: &YoutubeConfig, metadata: &YoutubeVideoMetadata) -> Result<()> {
+    if metadata.duration_seconds > config.max_duration_seconds {
+        bail!(
+            "Відео YouTube заблоковано: {} триває {}, ліміт зараз {}.",
+            metadata.title,
+            format_duration(metadata.duration_seconds),
+            format_duration(config.max_duration_seconds)
+        );
+    }
+
+    if !config.allow_non_music && metadata.category_id != MUSIC_CATEGORY_ID {
+        bail!(
+            "Відео YouTube заблоковано: {} не позначено як Музика в YouTube. Увімкни дозвіл не-музики, щоб пропускати винятки.",
+            metadata.title
+        );
+    }
+
+    Ok(())
+}
+
 pub async fn validate_video(
     config: &AppConfig,
     video: &YoutubeVideoRef,
 ) -> Result<YoutubeVideoMetadata> {
     let metadata = video_metadata(config, video).await?;
-
-    if metadata.duration_seconds > config.youtube.max_duration_seconds {
-        bail!(
-            "Video YouTube bloqueado: {} tem {}, limite atual e {}.",
-            metadata.title,
-            format_duration(metadata.duration_seconds),
-            format_duration(config.youtube.max_duration_seconds)
-        );
-    }
-
-    if !config.youtube.allow_non_music && metadata.category_id != MUSIC_CATEGORY_ID {
-        bail!(
-            "Video YouTube bloqueado: {} nao esta marcado como Musica no YouTube. Ative aceitar nao-musica para liberar excecoes.",
-            metadata.title
-        );
-    }
-
+    enforce_video_policy(&config.youtube, &metadata)?;
     Ok(metadata)
 }
 
@@ -123,13 +137,13 @@ pub async fn search_and_validate(config: &AppConfig, query: &str) -> Result<Yout
     }
 
     choose_best_video(query, valid_candidates).ok_or_else(|| {
-        last_error.unwrap_or_else(|| anyhow!("Nenhum video YouTube encontrado para {query}"))
+        last_error.unwrap_or_else(|| anyhow!("Не знайдено відео YouTube для {query}"))
     })
 }
 
 async fn search_videos(config: &AppConfig, query: &str) -> Result<Vec<String>> {
     let api_keys = youtube_api_keys(config)?;
-    let client = Client::new();
+    let client = crate::net::http_client();
     let mut last_error = None;
 
     for (index, api_key) in api_keys.iter().enumerate() {
@@ -169,18 +183,18 @@ async fn search_videos(config: &AppConfig, query: &str) -> Result<Vec<String>> {
             .collect::<Vec<_>>();
 
         if video_ids.is_empty() {
-            bail!("Nenhum video YouTube encontrado para {}", query.trim());
+            bail!("Не знайдено відео YouTube для {}", query.trim());
         }
 
         return Ok(video_ids);
     }
 
-    Err(last_error.unwrap_or_else(|| anyhow!("YouTube API key nao configurada")))
+    Err(last_error.unwrap_or_else(|| anyhow!("YouTube API key не налаштована")))
 }
 
 async fn fetch_video_metadata(config: &AppConfig, video_id: &str) -> Result<YoutubeVideoMetadata> {
     let api_keys = youtube_api_keys(config)?;
-    let client = Client::new();
+    let client = crate::net::http_client();
     let mut last_error = None;
 
     let mut item = None;
@@ -216,16 +230,16 @@ async fn fetch_video_metadata(config: &AppConfig, video_id: &str) -> Result<Yout
                 .items
                 .into_iter()
                 .next()
-                .ok_or_else(|| anyhow!("Video YouTube nao encontrado ou indisponivel"))?,
+                .ok_or_else(|| anyhow!("Відео YouTube не знайдено або недоступне"))?,
         );
         break;
     }
     let item = item
-        .ok_or_else(|| last_error.unwrap_or_else(|| anyhow!("YouTube API key nao configurada")))?;
+        .ok_or_else(|| last_error.unwrap_or_else(|| anyhow!("YouTube API key не налаштована")))?;
     let duration_seconds =
         parse_iso8601_duration(&item.content_details.duration).ok_or_else(|| {
             anyhow!(
-                "Duracao YouTube invalida: {}",
+                "Недійсна тривалість YouTube: {}",
                 item.content_details.duration
             )
         })?;
@@ -250,7 +264,9 @@ fn youtube_api_keys(config: &AppConfig) -> Result<Vec<String>> {
             .into_iter()
             .next()
             .map(|key| vec![key])
-            .context("YouTube API key nao configurada; configure para validar duracao/categoria");
+            .context(
+                "YouTube API key не налаштована; налаштуй для перевірки тривалості/категорії",
+            );
     }
 
     Ok(config.youtube.api_keys.clone())
@@ -453,6 +469,7 @@ fn normalize(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::YoutubePlayback;
 
     #[test]
     fn ranks_music_category_above_unrequested_live_clip() {
@@ -476,6 +493,54 @@ mod tests {
         let selected = choose_best_video("mamonas assassinas", videos).expect("selected");
 
         assert_eq!(selected.video_id, "music");
+    }
+
+    fn policy_config(max_duration_seconds: u64, allow_non_music: bool) -> YoutubeConfig {
+        YoutubeConfig {
+            api_key: None,
+            api_keys: Vec::new(),
+            playback: YoutubePlayback::Browser,
+            pear_base_url: String::new(),
+            max_duration_seconds,
+            allow_non_music,
+            cookies_file: None,
+        }
+    }
+
+    fn metadata(duration_seconds: u64, category_id: &str) -> YoutubeVideoMetadata {
+        YoutubeVideoMetadata {
+            video_id: "id".to_string(),
+            title: "Трек".to_string(),
+            channel_title: "Канал".to_string(),
+            duration_seconds,
+            category_id: category_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn reject_overlong_video_by_url_policy() {
+        let config = policy_config(360, true);
+        let error = enforce_video_policy(&config, &metadata(490, MUSIC_CATEGORY_ID))
+            .expect_err("long video must be rejected");
+
+        assert!(error.to_string().contains("заблоковано"));
+    }
+
+    #[test]
+    fn reject_non_music_video_by_url_policy() {
+        let config = policy_config(360, false);
+        let error = enforce_video_policy(&config, &metadata(180, "22"))
+            .expect_err("non-music video must be rejected");
+
+        assert!(error.to_string().contains("заблоковано"));
+    }
+
+    #[test]
+    fn accept_short_music_video_by_url_policy() {
+        let config = policy_config(360, false);
+
+        enforce_video_policy(&config, &metadata(180, MUSIC_CATEGORY_ID))
+            .expect("short music video must pass");
     }
 
     #[test]

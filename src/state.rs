@@ -1,7 +1,7 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{
-        atomic::{AtomicBool, AtomicU8},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc,
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -10,6 +10,7 @@ use std::{
 use serde::Serialize;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
+use crate::backup::BackupPlaylist;
 use crate::config::{self, AppConfig, APP_NAME};
 use crate::song_requests::{QueueView, SongQueue};
 use crate::spotify::{load_token, SpotifyAuthSession, SpotifyToken};
@@ -34,6 +35,12 @@ pub struct AppState {
     pub pear_waiting_video_id: Arc<Mutex<Option<String>>>,
     pub youtube_waiting_spotify_title: Arc<Mutex<Option<String>>>,
     pub spotify_manual_playback_title: Arc<Mutex<Option<String>>>,
+    pub backup: Arc<RwLock<BackupPlaylist>>,
+    /// Id reported by the last successful `/api/player/youtube/finish`.
+    /// Backup ids are cursor positions, so without this guard a repeated
+    /// finish call would skip an extra track.
+    pub last_player_finish: Arc<AtomicU64>,
+    pub video_meta_cache: Arc<Mutex<HashMap<String, (String, String)>>>,
     pub events: Arc<RwLock<EventLog>>,
     pub shutdown: broadcast::Sender<()>,
 }
@@ -86,17 +93,26 @@ impl AppState {
             crate::song_requests::MusicProvider::Youtube,
             crate::config::YoutubePlayback::Browser,
         );
-
-        Self {
+        let browser_paused = config::load_player_state(&config.paths).youtube_browser_paused;
+        let backup = BackupPlaylist::load(&config.paths);
+        let state_queue = if backup.enabled {
+            match crate::song_requests::backup_song_request(&backup) {
+                Some(request) => queue.with_backup_entry(request),
+                None => queue,
+            }
+        } else {
+            queue
+        };
+        let state = Self {
             spotify_token: Arc::new(RwLock::new(load_token(&config).ok().flatten())),
             config,
             app_name: APP_NAME,
             version: env!("CARGO_PKG_VERSION"),
-            queue: Arc::new(RwLock::new(queue)),
+            queue: Arc::new(RwLock::new(state_queue)),
             spotify_auth: Arc::new(RwLock::new(None)),
             twitch_bot_running: Arc::new(AtomicBool::new(false)),
             youtube_player_paused_spotify: Arc::new(AtomicBool::new(false)),
-            youtube_browser_paused: Arc::new(AtomicBool::new(false)),
+            youtube_browser_paused: Arc::new(AtomicBool::new(browser_paused)),
             youtube_browser_volume: Arc::new(AtomicU8::new(browser_volume)),
             spotify_fallback_started: Arc::new(AtomicBool::new(false)),
             spotify_manual_pause_active: Arc::new(AtomicBool::new(false)),
@@ -106,13 +122,41 @@ impl AppState {
             pear_waiting_video_id: Arc::new(Mutex::new(None)),
             youtube_waiting_spotify_title: Arc::new(Mutex::new(None)),
             spotify_manual_playback_title: Arc::new(Mutex::new(None)),
+            backup: Arc::new(RwLock::new(backup)),
+            last_player_finish: Arc::new(AtomicU64::new(0)),
+            video_meta_cache: Arc::new(Mutex::new(HashMap::new())),
             events: Arc::new(RwLock::new(EventLog::new())),
             shutdown,
+        };
+        state
+    }
+
+    /// Move to the next backup track and keep the queue in sync: the backup
+    /// entry that just played is dropped and the new one is appended.
+    pub async fn advance_and_sync(&self, paths: &crate::config::AppPaths) {
+        {
+            let mut playlist = self.backup.write().await;
+            playlist.advance();
+            playlist.save(paths);
         }
+        crate::request_flow::sync_backup_queue(self).await;
     }
 
     pub async fn record_event(&self, kind: &'static str, message: impl Into<String>) {
         self.events.write().await.push(kind, message.into());
+    }
+
+    /// Store the OBS Browser player paused state and persist it across restarts.
+    pub fn set_browser_paused(&self, paused: bool) {
+        self.youtube_browser_paused.store(paused, Ordering::SeqCst);
+        if let Err(error) = config::save_player_state(
+            &self.config.paths,
+            &config::PlayerState {
+                youtube_browser_paused: paused,
+            },
+        ) {
+            tracing::warn!(%error, "failed to persist browser paused state");
+        }
     }
 }
 

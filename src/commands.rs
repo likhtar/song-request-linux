@@ -118,16 +118,16 @@ pub enum PlaybackAction {
 impl Default for CommandAliases {
     fn default() -> Self {
         Self {
-            song_request: commands(&["!sr"]),
-            current_song: commands(&["!song"]),
-            queue: commands(&["!queue", "!fila", "!q"]),
-            remove: commands(&["!rm", "!remove"]),
-            skip: commands(&["!skip"]),
-            play: commands(&["!play", "!resume"]),
-            pause: commands(&["!pause", "!stop"]),
-            next: commands(&["!next", "!pular"]),
-            volume: commands(&["!vol", "!volume"]),
-            help: commands(&["!commands", "!comandos", "!help"]),
+            song_request: commands(&["!діджей", "!музика", "!sr", "dj", "во"]),
+            current_song: commands(&["!щограє", "!song"]),
+            queue: commands(&["!черга", "!queue", "!fila", "!q"]),
+            remove: commands(&["!прибери", "!rm", "!remove"]),
+            skip: commands(&["!пропусти", "!skip"]),
+            play: commands(&["!грай", "!play", "!resume"]),
+            pause: commands(&["!пауза", "!pause", "!stop"]),
+            next: commands(&["!наступна", "!next", "!pular"]),
+            volume: commands(&["!гучність", "!vol", "!volume"]),
+            help: commands(&["!команди", "!commands", "!comandos", "!help"]),
         }
     }
 }
@@ -268,10 +268,14 @@ pub fn parse_chat_command(input: ChatCommandInput, settings: &CommandSettings) -
     ChatCommand::Ignored
 }
 
+fn eq_ignore_case(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
 fn command_payload<'a>(message: &'a str, command: &str) -> Option<&'a str> {
     let (head, tail) = message.split_once(char::is_whitespace)?;
 
-    if head.eq_ignore_ascii_case(command) {
+    if eq_ignore_case(head, command) {
         Some(tail.trim())
     } else {
         None
@@ -287,7 +291,7 @@ fn command_payload_any<'a>(message: &'a str, commands: &[String]) -> Option<&'a 
 fn matches_command(message: &str, commands: &[String]) -> bool {
     commands
         .iter()
-        .any(|command| message.eq_ignore_ascii_case(command))
+        .any(|command| eq_ignore_case(message, command))
 }
 
 fn volume_payload(message: &str, commands: &[String]) -> Option<Option<u8>> {
@@ -475,7 +479,7 @@ mod tests {
             command,
             ChatCommand::AccessDenied {
                 requester: "viewer".to_string(),
-                command: "!skip".to_string(),
+                command: "!пропусти".to_string(),
                 required: CommandAccess::Moderator
             }
         );
@@ -537,7 +541,7 @@ mod tests {
             command,
             ChatCommand::AccessDenied {
                 requester: "viewer".to_string(),
-                command: "!vol".to_string(),
+                command: "!гучність".to_string(),
                 required: CommandAccess::Moderator
             }
         );
@@ -556,7 +560,7 @@ mod tests {
             command,
             ChatCommand::AccessDenied {
                 requester: "viewer".to_string(),
-                command: "!pause".to_string(),
+                command: "!пауза".to_string(),
                 required: CommandAccess::Moderator
             }
         );
@@ -626,7 +630,7 @@ mod tests {
             viewer,
             ChatCommand::AccessDenied {
                 requester: "viewer".to_string(),
-                command: "!sr".to_string(),
+                command: "!діджей".to_string(),
                 required: CommandAccess::Subscriber
             }
         );
@@ -661,7 +665,7 @@ mod tests {
             viewer,
             ChatCommand::AccessDenied {
                 requester: "viewer".to_string(),
-                command: "!sr".to_string(),
+                command: "!діджей".to_string(),
                 required: CommandAccess::Vip
             }
         );
@@ -695,7 +699,7 @@ mod tests {
             mod_command,
             ChatCommand::AccessDenied {
                 requester: "mod".to_string(),
-                command: "!skip".to_string(),
+                command: "!пропусти".to_string(),
                 required: CommandAccess::Streamer
             }
         );
@@ -731,5 +735,78 @@ mod tests {
                 role: ChatUserRole::Follower
             }
         );
+    }
+
+    #[test]
+    fn parses_cyrillic_song_request_alias() {
+        let command = parse(ChatCommandInput {
+            requester: "viewer".to_string(),
+            message: "!музика daft punk".to_string(),
+            is_moderator: false,
+            role: ChatUserRole::Follower,
+        });
+
+        assert_eq!(
+            command,
+            ChatCommand::SongRequest {
+                input: SongRequestInput {
+                    requester: "viewer".to_string(),
+                    query: "daft punk".to_string()
+                },
+                role: ChatUserRole::Follower
+            }
+        );
+    }
+
+    #[test]
+    fn cyrillic_alias_is_case_insensitive() {
+        let command = parse(ChatCommandInput {
+            requester: "viewer".to_string(),
+            message: "!Черга".to_string(),
+            is_moderator: false,
+            role: ChatUserRole::Follower,
+        });
+
+        assert_eq!(command, ChatCommand::Queue);
+    }
+
+    #[test]
+    fn parses_didejey_alias() {
+        let command = parse(ChatCommandInput {
+            requester: "viewer".to_string(),
+            message: "!діджей скатман".to_string(),
+            is_moderator: false,
+            role: ChatUserRole::Follower,
+        });
+
+        assert_eq!(
+            command,
+            ChatCommand::SongRequest {
+                input: SongRequestInput {
+                    requester: "viewer".to_string(),
+                    query: "скатман".to_string()
+                },
+                role: ChatUserRole::Follower
+            }
+        );
+    }
+
+    #[test]
+    fn parses_dj_and_vo_aliases() {
+        let dj = parse(ChatCommandInput {
+            requester: "viewer".to_string(),
+            message: "dj rock".to_string(),
+            is_moderator: false,
+            role: ChatUserRole::Follower,
+        });
+        let vo = parse(ChatCommandInput {
+            requester: "viewer".to_string(),
+            message: "во хвиля".to_string(),
+            is_moderator: false,
+            role: ChatUserRole::Follower,
+        });
+
+        assert!(matches!(dj, ChatCommand::SongRequest { .. }));
+        assert!(matches!(vo, ChatCommand::SongRequest { .. }));
     }
 }

@@ -217,7 +217,7 @@ pub async fn current_user_product(
 ) -> Result<Option<String>> {
     refresh_if_needed(config, token).await?;
 
-    let response = Client::new()
+    let response = crate::net::http_client()
         .get(format!("{API_URL}/me"))
         .bearer_auth(&token.access_token)
         .send()
@@ -283,7 +283,7 @@ pub async fn exchange_code(
         .as_ref()
         .context("SPOTIFY_CLIENT_ID is not configured")?;
 
-    let response = Client::new()
+    let response = crate::net::http_client()
         .post(TOKEN_URL)
         .form(&[
             ("grant_type", "authorization_code"),
@@ -382,7 +382,7 @@ pub async fn list_playlists(
 ) -> Result<Vec<SpotifyPlaylistItem>> {
     refresh_if_needed(config, token).await?;
 
-    let response = Client::new()
+    let response = crate::net::http_client()
         .get(format!("{API_URL}/me/playlists"))
         .bearer_auth(&token.access_token)
         .query(&[("limit", "50")])
@@ -418,7 +418,7 @@ pub async fn queue_snapshot(
 ) -> Result<SpotifyQueueSnapshot> {
     refresh_if_needed(config, token).await?;
 
-    let response = Client::new()
+    let response = crate::net::http_client()
         .get(format!("{API_URL}/me/player/queue"))
         .bearer_auth(&token.access_token)
         .send()
@@ -519,6 +519,7 @@ pub async fn set_volume(config: &AppConfig, token: &mut SpotifyToken, level: u8)
 
     let response = Client::builder()
         .http1_only()
+        .timeout(Duration::from_secs(30))
         .build()?
         .put(format!("{API_URL}/me/player/volume"))
         .bearer_auth(&token.access_token)
@@ -538,7 +539,7 @@ pub async fn set_volume(config: &AppConfig, token: &mut SpotifyToken, level: u8)
             level,
             "spotify volume change failed"
         );
-        bail!("Spotify nao aceitou mudar o volume ({status}): {body}");
+        bail!("Spotify не прийняв зміну гучності ({status}): {body}");
     }
 
     Ok(level.min(100))
@@ -554,6 +555,7 @@ pub async fn play_context(
 
     let response = Client::builder()
         .http1_only()
+        .timeout(Duration::from_secs(30))
         .build()?
         .put(format!("{API_URL}/me/player/play"))
         .bearer_auth(&token.access_token)
@@ -577,7 +579,7 @@ pub async fn play_context(
         context_uri,
         "spotify context playback failed"
     );
-    bail!("Spotify nao aceitou iniciar a playlist ({status}): {body}");
+    bail!("Spotify не прийняв запуск плейлиста ({status}): {body}");
 }
 
 pub async fn resume_playback(config: &AppConfig, token: &mut SpotifyToken) -> Result<()> {
@@ -677,7 +679,7 @@ async fn refresh_if_needed(config: &AppConfig, token: &mut SpotifyToken) -> Resu
         .as_ref()
         .context("SPOTIFY_CLIENT_ID is not configured")?;
 
-    let response = Client::new()
+    let response = crate::net::http_client()
         .post(TOKEN_URL)
         .form(&[
             ("grant_type", "refresh_token"),
@@ -697,7 +699,7 @@ async fn refresh_if_needed(config: &AppConfig, token: &mut SpotifyToken) -> Resu
             "spotify token refresh failed"
         );
         bail!(
-            "Spotify precisa ser reconectado: o token salvo nao foi aceito ({status}). Abra Configuracao > Spotify > Login Spotify. Detalhe: {body}"
+            "Spotify потрібно перепідключити: збережений токен не прийнято ({status}). Відкрий Налаштування > Spotify > Увійти в Spotify. Деталі: {body}"
         );
     }
 
@@ -714,7 +716,7 @@ async fn refresh_if_needed(config: &AppConfig, token: &mut SpotifyToken) -> Resu
 }
 
 async fn search_track(token: &SpotifyToken, query: &str) -> Result<SpotifyTrack> {
-    let response = Client::new()
+    let response = crate::net::http_client()
         .get(format!("{API_URL}/search"))
         .bearer_auth(&token.access_token)
         .query(&[("type", "track"), ("limit", "10"), ("q", query)])
@@ -731,7 +733,7 @@ async fn search_track(token: &SpotifyToken, query: &str) -> Result<SpotifyTrack>
 }
 
 async fn get_track(token: &SpotifyToken, track_id: &str) -> Result<SpotifyTrack> {
-    let response = Client::new()
+    let response = crate::net::http_client()
         .get(format!("{API_URL}/tracks/{track_id}"))
         .bearer_auth(&token.access_token)
         .send()
@@ -751,7 +753,7 @@ async fn get_track(token: &SpotifyToken, track_id: &str) -> Result<SpotifyTrack>
 }
 
 async fn spotify_queue_contains(token: &SpotifyToken, title: &str) -> Result<bool> {
-    let response = Client::new()
+    let response = crate::net::http_client()
         .get(format!("{API_URL}/me/player/queue"))
         .bearer_auth(&token.access_token)
         .send()
@@ -915,6 +917,7 @@ async fn add_to_queue_once(token: &SpotifyToken, uri: &str) -> Result<(), Spotif
     debug!(uri = %uri, "spotify add-to-queue request");
     let response = Client::builder()
         .http1_only()
+        .timeout(Duration::from_secs(30))
         .build()
         .map_err(SpotifyQueueError::technical)?
         .post(format!("{API_URL}/me/player/queue"))
@@ -945,13 +948,13 @@ async fn add_to_queue_once(token: &SpotifyToken, uri: &str) -> Result<(), Spotif
     Err(SpotifyQueueError {
         no_active_device: status.as_u16() == 404 && body.contains("NO_ACTIVE_DEVICE"),
         error: anyhow!(
-            "Spotify nao encontrou um device de stream ativo ({status}). Abra o Spotify no PC da live; celular nao e usado para playback do app. Resposta: {body}"
+            "Spotify не знайшов активний пристрій стриму ({status}). Відкрий Spotify на ПК, де йде трансляція; телефон не використовується для відтворення додатку. Відповідь: {body}"
         ),
     })
 }
 
 async fn fetch_devices(token: &SpotifyToken) -> Result<SpotifyDevicesResponse> {
-    let response = Client::new()
+    let response = crate::net::http_client()
         .get(format!("{API_URL}/me/player/devices"))
         .bearer_auth(&token.access_token)
         .send()
@@ -981,12 +984,12 @@ async fn transfer_to_available_device(token: &SpotifyToken) -> Result<SpotifyDev
         .cloned()
         .ok_or_else(|| {
             anyhow!(
-                "Nenhum device Spotify de stream disponivel. Abra o Spotify no PC da live; o app nao transfere playback para celular."
+                "Немає доступного Spotify-пристрою для стриму. Відкрий Spotify на ПК, де йде трансляція; додаток не переносить відтворення на телефон."
             )
         })?;
 
     let device_id = device.id.as_ref().expect("device id checked");
-    let response = Client::new()
+    let response = crate::net::http_client()
         .put(format!("{API_URL}/me/player"))
         .bearer_auth(&token.access_token)
         .json(&serde_json::json!({
@@ -1007,7 +1010,7 @@ async fn transfer_to_available_device(token: &SpotifyToken) -> Result<SpotifyDev
             "spotify transfer playback failed"
         );
         bail!(
-            "Spotify abriu o device {}, mas falhou ao transferir playback ({status}): {body}",
+            "Spotify відкрив пристрій {}, але не вийшло перенести відтворення ({status}): {body}",
             device.name
         );
     }
@@ -1042,6 +1045,7 @@ async fn player_empty_request(
 ) -> Result<()> {
     let mut request = Client::builder()
         .http1_only()
+        .timeout(Duration::from_secs(30))
         .build()?
         .request(method, format!("{API_URL}/{path}"))
         .bearer_auth(&token.access_token)
@@ -1069,7 +1073,7 @@ async fn player_empty_request(
         path,
         "spotify player command failed"
     );
-    bail!("Spotify nao aceitou o comando {path} ({status}): {body}");
+    bail!("Spotify не прийняв команду {path} ({status}): {body}");
 }
 
 fn format_playable(item: SpotifyPlayable) -> Option<String> {

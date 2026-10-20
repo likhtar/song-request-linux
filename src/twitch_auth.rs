@@ -1,6 +1,5 @@
 use anyhow::{bail, Context, Result};
 use rand::{distr::Alphanumeric, Rng};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -83,7 +82,7 @@ fn config_twitch_client_id(config: &AppConfig) -> Result<String> {
 }
 
 async fn validate_token(token: &str) -> Result<String> {
-    let response = Client::new()
+    let response = crate::net::http_client()
         .get(TWITCH_VALIDATE_URL)
         .bearer_auth(token)
         .send()

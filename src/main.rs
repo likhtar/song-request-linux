@@ -1,3 +1,4 @@
+mod backup;
 mod commands;
 mod config;
 mod connections;
@@ -5,6 +6,7 @@ mod dashboard;
 mod diagnostics;
 mod display;
 mod http;
+mod net;
 mod overlay;
 mod pear;
 mod playback_coordinator;

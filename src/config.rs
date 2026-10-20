@@ -41,6 +41,7 @@ pub struct UserConfig {
     pub browser_volume: u8,
     pub youtube_max_duration_seconds: u64,
     pub youtube_allow_non_music: bool,
+    pub youtube_cookies_file: Option<String>,
     pub twitch_client_id: Option<String>,
     pub twitch_bot_username: Option<String>,
     pub twitch_channel: Option<String>,
@@ -208,6 +209,7 @@ pub struct YoutubeConfig {
     pub pear_base_url: String,
     pub max_duration_seconds: u64,
     pub allow_non_music: bool,
+    pub cookies_file: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -240,6 +242,7 @@ pub struct AppPaths {
     pub log_dir: PathBuf,
     pub tls_dir: PathBuf,
     pub queue_file: PathBuf,
+    pub backup_playlist_file: PathBuf,
 }
 
 impl AppConfig {
@@ -282,6 +285,7 @@ impl Default for UserConfig {
             browser_volume: 100,
             youtube_max_duration_seconds: 360,
             youtube_allow_non_music: false,
+            youtube_cookies_file: None,
             twitch_client_id: None,
             twitch_bot_username: None,
             twitch_channel: None,
@@ -325,6 +329,10 @@ impl YoutubeConfig {
             .unwrap_or_else(default_pear_base_url);
 
         let api_keys = youtube_api_keys_from_sources(user_secrets);
+        let cookies_file = user_config
+            .youtube_cookies_file
+            .clone()
+            .and_then(|value| clean_optional_value(Some(value)));
 
         Self {
             api_key: api_keys.first().cloned(),
@@ -333,6 +341,7 @@ impl YoutubeConfig {
             pear_base_url,
             max_duration_seconds,
             allow_non_music,
+            cookies_file,
         }
     }
 }
@@ -456,6 +465,7 @@ pub fn save_ui_config(paths: &AppPaths, input: UiConfigInput) -> Result<UiConfig
         youtube_allow_non_music: input
             .youtube_allow_non_music
             .unwrap_or(existing_config.youtube_allow_non_music),
+        youtube_cookies_file: existing_config.youtube_cookies_file.clone(),
         twitch_client_id: input
             .twitch_client_id
             .and_then(|value| clean_optional_value(Some(value)))
@@ -549,6 +559,29 @@ pub fn configured_volume(
             normalize_volume(user_config.browser_volume)
         }
     }
+}
+
+const PLAYER_STATE_FILENAME: &str = "player-state.json";
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PlayerState {
+    pub youtube_browser_paused: bool,
+}
+
+pub fn load_player_state(paths: &AppPaths) -> PlayerState {
+    let path = paths.state_dir.join(PLAYER_STATE_FILENAME);
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|data| serde_json::from_str(&data).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_player_state(paths: &AppPaths, state: &PlayerState) -> Result<()> {
+    fs::create_dir_all(&paths.state_dir)?;
+    let path = paths.state_dir.join(PLAYER_STATE_FILENAME);
+    fs::write(path, serde_json::to_vec_pretty(state)?)?;
+    Ok(())
 }
 
 pub fn export_user_config(paths: &AppPaths) -> ConfigBackup {
@@ -703,6 +736,10 @@ fn normalize_command_settings(mut settings: CommandSettings) -> CommandSettings 
     settings
 }
 
+fn eq_ignore_case(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
 fn normalize_aliases(values: Vec<String>, fallback: &[&str]) -> Vec<String> {
     let mut aliases = Vec::new();
     for value in values {
@@ -711,7 +748,7 @@ fn normalize_aliases(values: Vec<String>, fallback: &[&str]) -> Vec<String> {
         };
         if !aliases
             .iter()
-            .any(|item: &String| item.eq_ignore_ascii_case(&alias))
+            .any(|item: &String| eq_ignore_case(item, &alias))
         {
             aliases.push(alias);
         }
@@ -738,7 +775,7 @@ fn sanitize_command_alias(value: &str) -> Option<String> {
     if rest.is_empty()
         || !rest
             .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+            .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-'))
     {
         return None;
     }
@@ -818,6 +855,7 @@ impl AppPaths {
         let log_dir = state_dir.join("logs");
         let tls_dir = state_dir.join("tls");
         let queue_file = state_dir.join("queue.json");
+        let backup_playlist_file = state_dir.join("backup-playlist.json");
 
         Ok(Self {
             config_dir,
@@ -826,6 +864,7 @@ impl AppPaths {
             log_dir,
             tls_dir,
             queue_file,
+            backup_playlist_file,
         })
     }
 
@@ -1031,6 +1070,30 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_command_alias_allows_cyrillic() {
+        assert_eq!(
+            sanitize_command_alias("!музика"),
+            Some("!музика".to_string())
+        );
+        assert_eq!(
+            sanitize_command_alias("!діджей"),
+            Some("!діджей".to_string())
+        );
+        assert_eq!(sanitize_command_alias("!Черга"), Some("!Черга".to_string()));
+    }
+
+    #[test]
+    fn normalize_aliases_deduplicates_cyrillic_case_insensitively() {
+        let values = vec![
+            "!музика".to_string(),
+            "!Музика".to_string(),
+            "!МУЗИКА".to_string(),
+        ];
+        let aliases = normalize_aliases(values, &["!fallback"]);
+        assert_eq!(aliases, vec!["!музика"]);
+    }
+
+    #[test]
     fn pear_base_url_must_be_local_http() {
         assert_eq!(
             clean_local_pear_base_url("http://127.0.0.1:26538/api/v1".to_string()).as_deref(),
@@ -1058,6 +1121,7 @@ mod tests {
             log_dir: root.join("state/logs"),
             tls_dir: root.join("state/tls"),
             queue_file: root.join("state/queue.json"),
+            backup_playlist_file: root.join("state/backup-playlist.json"),
         };
         let _ = fs::remove_dir_all(&root);
 
@@ -1158,6 +1222,7 @@ mod tests {
             log_dir: root.join("state/logs"),
             tls_dir: root.join("state/tls"),
             queue_file: root.join("state/queue.json"),
+            backup_playlist_file: root.join("state/backup-playlist.json"),
         };
         let _ = fs::remove_dir_all(&root);
 

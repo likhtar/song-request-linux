@@ -13,6 +13,7 @@ use tokio::{process::Command, time::timeout};
 use tower_http::trace::TraceLayer;
 
 use crate::{
+    backup,
     commands::{parse_chat_command, ChatCommand, ChatCommandInput, ChatUserRole, PlaybackAction},
     config::{self, YoutubePlayback},
     connections, dashboard,
@@ -24,7 +25,7 @@ use crate::{
     },
     spotify,
     state::{AppState, HealthResponse, StatusResponse},
-    twitch_auth,
+    twitch_auth, youtube,
 };
 
 pub fn router(state: AppState) -> Router {
@@ -64,6 +65,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/song-requests", post(add_song_request))
         .route("/api/chat-command", post(chat_command))
         .route("/api/skip", post(skip))
+        .route("/api/play", post(playback_play))
+        .route("/api/pause", post(playback_pause))
         .route("/api/volume", get(volume_status).post(set_volume))
         .route("/overlay", get(overlay::page))
         .route("/player", get(player::page))
@@ -759,9 +762,29 @@ async fn youtube_player_audio(
         )));
     }
 
-    let audio_url = resolve_youtube_audio_url(&current_song.video_id)
-        .await
-        .map_err(ApiError::bad_request)?;
+    let audio_url = match resolve_youtube_audio_url(
+        &current_song.video_id,
+        state.config.youtube.cookies_file.as_deref(),
+    )
+    .await
+    {
+        Ok(url) => url,
+        Err(error) => {
+            // A broken backup track must not pin the player to endless
+            // retries: advance to the next entry so the next poll moves on.
+            // Real queue tracks keep failing loudly for the requester.
+            if backup::is_backup_sentinel(current_song.id) {
+                state.advance_and_sync(&state.config.paths).await;
+                state
+                    .record_event(
+                        "player",
+                        "Бекапний трек не відтворився; пропускаю до наступного",
+                    )
+                    .await;
+            }
+            return Err(ApiError::bad_request(error));
+        }
+    };
 
     Ok(Json(YoutubeAudioResponse { audio_url }))
 }
@@ -770,10 +793,27 @@ async fn youtube_player_finish(
     State(state): State<AppState>,
     Json(input): Json<YoutubePlayerSyncInput>,
 ) -> Result<Json<YoutubePlayerResponse>, ApiError> {
-    {
-        let mut queue = state.queue.write().await;
-        queue.remove_by_id(input.id);
-        save_queue_state(&state, &queue)?;
+    // The browser player only reports "ended" once, but it can repeat the
+    // call after a hiccup. For backup entries the id is the playlist cursor,
+    // not a unique track, so a repeated finish would skip the next backup
+    // track too. The guard below drops such duplicates.
+    if backup::is_backup_sentinel(input.id) {
+        if state.last_player_finish.swap(input.id, Ordering::SeqCst) == input.id {
+            return Ok(Json(youtube_player_response(&state).await));
+        }
+        state.advance_and_sync(&state.config.paths).await;
+        state
+            .record_event(
+                "player",
+                "Бекапний трек завершено; наступний з бекап-списку",
+            )
+            .await;
+    } else {
+        {
+            let mut queue = state.queue.write().await;
+            queue.remove_by_id(input.id);
+            save_queue_state(&state, &queue)?;
+        }
     }
 
     let current_song = current_youtube_song(&state).await;
@@ -1270,6 +1310,7 @@ async fn add_request_to_queue_for_role(
     match request_flow::add_request_for_role(state, input, role).await {
         Ok(request) => {
             save_current_queue_state(state).await?;
+            request_flow::sync_backup_queue(state).await;
             if is_youtube_browser_mode(state)
                 && matches!(request.source, RequestSource::Youtube { .. })
             {
@@ -1320,37 +1361,50 @@ fn is_youtube_browser_mode(state: &AppState) -> bool {
 }
 
 async fn local_browser_skip_message(state: &AppState, requester: &str) -> String {
-    state.youtube_browser_paused.store(false, Ordering::SeqCst);
-    let current_id = filtered_app_queue_view(
-        state,
-        MusicProvider::Youtube,
-        Some(YoutubeRequestPlayback::Browser),
-    )
-    .await
-    .current_song
-    .map(|song| song.id);
+    state.set_browser_paused(false);
 
-    let current_song = if let Some(id) = current_id {
-        let mut queue = state.queue.write().await;
-        queue.remove_by_id(id);
-        save_queue_state(state, &queue).ok();
-        filtered_app_queue_view(
-            state,
-            MusicProvider::Youtube,
-            Some(YoutubeRequestPlayback::Browser),
-        )
-        .await
-        .current_song
-    } else {
-        None
-    };
+    let playing = current_youtube_song(state).await;
+    if let Some(playing) = playing {
+        if backup::is_backup_sentinel(playing.id) {
+            // Skip a backup track: advance the playlist and resync the queue.
+            state.advance_and_sync(&state.config.paths).await;
+        } else {
+            let mut queue = state.queue.write().await;
+            queue.remove_by_id(playing.id);
+            save_queue_state(state, &queue).ok();
+        }
+    }
 
-    match current_song {
-        Some(song) => format!(
-            "@{requester} skip feito. Agora: {}",
-            display::chat_song_title(&song)
-        ),
+    match current_youtube_song(state).await {
+        Some(song) => format!("@{requester} skip feito. Agora: {}", song.title),
         None => format!("@{requester} skip feito. Fila vazia."),
+    }
+}
+
+async fn playback_play(State(state): State<AppState>) -> Json<PlaybackControlResponse> {
+    Json(playback_control(&state, true).await)
+}
+
+async fn playback_pause(State(state): State<AppState>) -> Json<PlaybackControlResponse> {
+    Json(playback_control(&state, false).await)
+}
+
+/// Play/pause for the local OBS browser player (https://127.0.0.1:7443/api/play
+/// and /api/pause). The player itself polls `/api/player/youtube` and applies
+/// the flag, so no client-side push is needed. Returns the flag that is now
+/// in effect.
+async fn playback_control(state: &AppState, play: bool) -> PlaybackControlResponse {
+    state.set_browser_paused(!play);
+    let message = if play {
+        "player retomado".to_string()
+    } else {
+        "player pausado".to_string()
+    };
+    state.record_event("player", message.clone()).await;
+
+    PlaybackControlResponse {
+        paused: state.youtube_browser_paused.load(Ordering::SeqCst),
+        message,
     }
 }
 
@@ -1361,15 +1415,15 @@ fn local_browser_playback_message(
 ) -> String {
     match action {
         PlaybackAction::Play => {
-            state.youtube_browser_paused.store(false, Ordering::SeqCst);
+            state.set_browser_paused(false);
             format!("@{requester} player OBS retomado.")
         }
         PlaybackAction::Pause => {
-            state.youtube_browser_paused.store(true, Ordering::SeqCst);
+            state.set_browser_paused(true);
             format!("@{requester} player OBS pausado.")
         }
         PlaybackAction::Next => {
-            state.youtube_browser_paused.store(false, Ordering::SeqCst);
+            state.set_browser_paused(false);
             format!("@{requester} pulando player OBS.")
         }
     }
@@ -1475,6 +1529,7 @@ fn request_matches_stream(
                 }
         ),
         MusicProvider::Youtube => match (&song.source, playback) {
+            (RequestSource::Backup, _) => true,
             (
                 RequestSource::Youtube {
                     playback: Some(source_playback),
@@ -1583,21 +1638,20 @@ async fn merge_spotify_and_app_queue(state: &AppState, mut spotify_view: QueueVi
 fn app_pending_requests(view: QueueView) -> Vec<SongRequest> {
     let mut requests = Vec::new();
 
-    if let Some(song) = view.current_song {
-        if matches!(
+    let playable = |song: &SongRequest| {
+        matches!(
             song.source,
-            RequestSource::Youtube { .. } | RequestSource::Spotify { .. }
-        ) {
+            RequestSource::Youtube { .. } | RequestSource::Spotify { .. } | RequestSource::Backup
+        )
+    };
+
+    if let Some(song) = view.current_song {
+        if playable(&song) {
             requests.push(song);
         }
     }
 
-    requests.extend(view.queue.into_iter().filter(|song| {
-        matches!(
-            song.source,
-            RequestSource::Youtube { .. } | RequestSource::Spotify { .. }
-        )
-    }));
+    requests.extend(view.queue.into_iter().filter(playable));
 
     requests
 }
@@ -1658,12 +1712,23 @@ fn spotify_song_request(id: u64, title: String) -> SongRequest {
 }
 
 async fn skip(State(state): State<AppState>) -> Json<SkipResponse> {
-    let current_song = state.queue.write().await.skip();
-    if let Err(error) = save_current_queue_state(&state).await {
-        state.record_event("error", error.message).await;
+    let was_backup = {
+        let queue = state.queue.read().await;
+        queue.is_current_backup()
+    };
+
+    if was_backup {
+        state.advance_and_sync(&state.config.paths).await;
+    } else {
+        state.queue.write().await.skip();
+        if let Err(error) = save_current_queue_state(&state).await {
+            state.record_event("error", error.message).await;
+        }
+        request_flow::sync_backup_queue(&state).await;
     }
     clear_youtube_state_if_no_pending(&state).await;
 
+    let current_song = { state.queue.read().await.view().current_song };
     Json(SkipResponse { current_song })
 }
 
@@ -1912,23 +1977,27 @@ async fn resume_spotify_after_youtube(state: &AppState) {
     }
 }
 
-async fn resolve_youtube_audio_url(video_id: &str) -> anyhow::Result<String> {
-    let output = timeout(
-        Duration::from_secs(20),
-        Command::new("yt-dlp")
-            .args([
-                "--no-playlist",
-                "--no-warnings",
-                "-f",
-                "bestaudio[ext=m4a]/bestaudio/best",
-                "-g",
-                &format!("https://www.youtube.com/watch?v={video_id}"),
-            ])
-            .output(),
-    )
-    .await
-    .map_err(|_| anyhow!("yt-dlp demorou demais para resolver o audio"))?
-    .map_err(|error| anyhow!("yt-dlp nao executou: {error}"))?;
+async fn resolve_youtube_audio_url(
+    video_id: &str,
+    cookies_file: Option<&str>,
+) -> anyhow::Result<String> {
+    let mut command = Command::new("yt-dlp");
+    command.args([
+        "--no-playlist",
+        "--no-warnings",
+        "-f",
+        "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/140/bestaudio/best",
+        "-g",
+    ]);
+    if let Some(cookies) = cookies_file {
+        command.args(["--cookies", cookies]);
+    }
+    command.arg(format!("https://www.youtube.com/watch?v={video_id}"));
+
+    let output = timeout(Duration::from_secs(20), command.output())
+        .await
+        .map_err(|_| anyhow!("yt-dlp demorou demais para resolver o audio"))?
+        .map_err(|error| anyhow!("yt-dlp nao executou: {error}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2017,6 +2086,12 @@ struct SkipResponse {
     current_song: Option<SongRequest>,
 }
 
+#[derive(Debug, Serialize)]
+struct PlaybackControlResponse {
+    paused: bool,
+    message: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct VolumeInput {
     level: Option<u8>,
@@ -2070,13 +2145,17 @@ struct YoutubePlayerSong {
 
 impl YoutubePlayerSong {
     fn from_request(song: &SongRequest) -> Option<Self> {
-        let RequestSource::Youtube { video_id, .. } = &song.source else {
-            return None;
+        let video_id = match &song.source {
+            RequestSource::Youtube { video_id, .. } => video_id.clone(),
+            // Backup entries are ordinary YouTube videos queued from the
+            // backup playlist.
+            RequestSource::Backup => youtube::YoutubeVideoRef::parse(&song.query)?.video_id,
+            _ => return None,
         };
 
         Some(Self {
             id: song.id,
-            video_id: video_id.clone(),
+            video_id,
             title: song.title.clone(),
             artist: song.artist.clone(),
             requester: song.requester.clone(),
@@ -2173,8 +2252,14 @@ mod tests {
             .as_nanos();
         let root = std::env::temp_dir().join(format!("song-request-linux-http-{name}-{unique}"));
         config.paths.config_dir = root.join("config");
+        config.paths.cache_dir = root.join("cache");
         config.paths.state_dir = root.join("state");
+        config.paths.log_dir = config.paths.state_dir.join("logs");
+        config.paths.tls_dir = config.paths.state_dir.join("tls");
         config.paths.queue_file = config.paths.state_dir.join("queue.json");
+        // Without this the test would load the developer's real backup
+        // playlist and any `advance_and_sync` would touch real files.
+        config.paths.backup_playlist_file = config.paths.state_dir.join("backup-playlist.json");
         config.default_provider = provider;
         config.youtube.playback = playback;
         crate::config::save_ui_config(
@@ -2332,6 +2417,164 @@ mod tests {
             Some("dQw4w9WgXcQ".to_string())
         );
         assert_eq!(response.waiting_for_spotify, None);
+    }
+
+    #[tokio::test]
+    async fn play_and_pause_endpoints_toggle_the_browser_player() {
+        let config = isolated_config(
+            "playback-endpoints",
+            MusicProvider::Youtube,
+            YoutubePlayback::Browser,
+        );
+        let state = AppState::new(config);
+
+        let pause = playback_pause(State(state.clone())).await;
+        assert!(pause.0.paused);
+
+        let resume = playback_play(State(state.clone())).await;
+        assert!(!resume.0.paused);
+    }
+
+    #[tokio::test]
+    async fn backup_track_is_served_through_the_player_queue() {
+        let config = isolated_config(
+            "player-backup-track",
+            MusicProvider::Youtube,
+            YoutubePlayback::Browser,
+        );
+        let state = AppState::new(config);
+        state.queue.write().await.clear();
+        state.queue.write().await.append_raw(SongRequest {
+            id: backup::sentinel_id(0),
+            requester: "Backup".to_string(),
+            query: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+            source: RequestSource::Backup,
+            title: "Бекап 1".to_string(),
+            artist: "Фонова музика".to_string(),
+        });
+
+        let response = youtube_player_response(&state).await;
+        let song = response.current_song.expect("backup song");
+
+        assert_eq!(song.video_id, "dQw4w9WgXcQ");
+        assert_eq!(song.id, backup::sentinel_id(0));
+    }
+
+    /// Queue two backup tracks (sentinel 0 = current, sentinel 1 = next) in
+    /// an otherwise empty queue, so an `advance_and_sync` can be observed.
+    async fn park_two_backup_tracks(state: &AppState) {
+        let mut queue = state.queue.write().await;
+        queue.clear();
+        for position in 0..2 {
+            queue.append_raw(SongRequest {
+                id: backup::sentinel_id(position),
+                requester: "Backup".to_string(),
+                query: format!("https://www.youtube.com/watch?v=dQw4w9WgXcQ&i={position}"),
+                source: RequestSource::Backup,
+                title: format!("Бекап {}", position + 1),
+                artist: "Фонова музика".to_string(),
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_finish_for_the_same_backup_track_is_ignored() {
+        let config = isolated_config(
+            "player-backup-finish-guard",
+            MusicProvider::Youtube,
+            YoutubePlayback::Browser,
+        );
+        // Playlist with two tracks; `cursor: 0` is the one currently playing.
+        std::fs::create_dir_all(config.paths.state_dir.clone()).expect("state dir");
+        std::fs::write(
+            &config.paths.backup_playlist_file,
+            serde_json::json!({
+                "enabled": true,
+                "urls": [
+                    "https://youtu.be/dQw4w9WgXcQ",
+                    "https://youtu.be/9bZkp7q19f0"
+                ],
+                "order": [0, 1],
+                "cursor": 0
+            })
+            .to_string(),
+        )
+        .expect("write playlist");
+
+        let state = AppState::new(config);
+        park_two_backup_tracks(&state).await;
+        let app = router(state.clone());
+        let send_finish = |id: u64| {
+            app.clone().oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/player/youtube/finish")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"id":{id}}}"#)))
+                    .expect("request"),
+            )
+        };
+
+        let first = send_finish(backup::sentinel_id(0)).await.expect("response");
+        assert_eq!(first.status(), StatusCode::OK);
+
+        // The finished backup must leave the queue and the next one must be
+        // promoted, i.e. the playlist really advanced by exactly one step.
+        let view = state.queue.read().await.view();
+        assert_eq!(
+            view.current_song.as_ref().map(|song| song.id),
+            Some(backup::sentinel_id(1)),
+            "the next backup must take over, got {view:?}"
+        );
+        assert_eq!(
+            state.backup.read().await.current_position(),
+            1,
+            "the playlist cursor must move exactly one step"
+        );
+
+        // The id of a backup entry is the playlist cursor, not a unique
+        // track id, so the player can repeat the same finish after a hiccup.
+        // That duplicate must be ignored: advancing again would skip the
+        // backup that just started.
+        let second = send_finish(backup::sentinel_id(0)).await.expect("response");
+        assert_eq!(second.status(), StatusCode::OK);
+
+        let view = state.queue.read().await.view();
+        assert_eq!(
+            view.current_song.as_ref().map(|song| song.id),
+            Some(backup::sentinel_id(1)),
+            "a repeated finish must not advance the playlist again, got {view:?}"
+        );
+        assert_eq!(
+            state.backup.read().await.current_position(),
+            1,
+            "a repeated finish must not move the cursor again"
+        );
+        assert!(view.queue.is_empty(), "nothing may be queued, got {view:?}");
+    }
+
+    #[tokio::test]
+    async fn skip_endpoint_advances_past_a_backup_track() {
+        let config = isolated_config(
+            "skip-backup-track",
+            MusicProvider::Youtube,
+            YoutubePlayback::Browser,
+        );
+        let state = AppState::new(config);
+        state.queue.write().await.clear();
+        state.queue.write().await.append_raw(SongRequest {
+            id: backup::sentinel_id(0),
+            requester: "Backup".to_string(),
+            query: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+            source: RequestSource::Backup,
+            title: "Бекап 1".to_string(),
+            artist: "Фонова музика".to_string(),
+        });
+
+        let response = skip(State(state.clone())).await;
+
+        assert!(response.0.current_song.is_none());
+        assert!(!state.queue.read().await.is_current_backup());
     }
 
     #[tokio::test]

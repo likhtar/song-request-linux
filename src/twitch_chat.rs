@@ -1,10 +1,13 @@
-use anyhow::{Context, Result};
-use futures_util::{SinkExt, StreamExt};
+use anyhow::{anyhow, Context, Result};
+use futures_util::{Sink, SinkExt, StreamExt};
 use std::{
     collections::HashMap,
     sync::atomic::Ordering,
+    sync::Arc,
     time::{Duration, Instant},
 };
+use tokio::sync::{Mutex, Semaphore};
+use tokio::time::{interval, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
@@ -14,9 +17,27 @@ use crate::{
     display, request_flow,
     song_requests::{MusicProvider, QueueView, RequestSource, SongRequest, YoutubeRequestPlayback},
     state::AppState,
+    youtube,
 };
 
 const TWITCH_IRC_WS: &str = "wss://irc-ws.chat.twitch.tv:443";
+
+/// Any socket write that takes longer than this is treated as a dead
+/// connection so a stuck send can never pin the shared writer lock.
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// A chat command that runs longer than this is cancelled, so a hung
+/// external API call cannot wedge the shared rate limiter lock forever.
+const HANDLER_TIMEOUT: Duration = Duration::from_secs(60);
+/// If nothing at all arrives from Twitch for this long, the socket is
+/// considered dead (open but silent) and we force a reconnect. Must be
+/// comfortably longer than Twitch's own PING cadence (~5 min) so a quiet
+/// channel alone never triggers a needless reconnect.
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(540);
+/// Client-side keepalive PING. Twitch answers PONG, so this keeps traffic
+/// flowing both ways and lets the read-idle watchdog detect dead sockets.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(45);
+const BASE_RECONNECT_DELAY: Duration = Duration::from_secs(5);
+const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 
 pub fn spawn_bot(state: AppState, secrets: TwitchBotSecrets) {
     if state
@@ -36,13 +57,28 @@ pub fn spawn_bot(state: AppState, secrets: TwitchBotSecrets) {
 }
 
 async fn run_bot(state: AppState, secrets: TwitchBotSecrets) -> Result<()> {
-    let running = state.twitch_bot_running.clone();
-    let result = run_bot_inner(&state, secrets).await;
-    running.store(false, Ordering::SeqCst);
-    result
+    let mut backoff = BASE_RECONNECT_DELAY;
+    loop {
+        let started = Instant::now();
+        match connect_and_serve(&state, &secrets).await {
+            Ok(()) => warn!("twitch websocket closed; reconnecting in {:?}", backoff),
+            Err(error) => warn!(
+                error = %error,
+                "twitch bot connection failed; retrying in {:?}",
+                backoff
+            ),
+        }
+        // A session that stayed healthy for a while resets the backoff;
+        // only rapid consecutive failures keep ramping up the delay.
+        if started.elapsed() > Duration::from_secs(60) {
+            backoff = BASE_RECONNECT_DELAY;
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = backoff.saturating_mul(2).min(MAX_RECONNECT_BACKOFF);
+    }
 }
 
-async fn run_bot_inner(state: &AppState, secrets: TwitchBotSecrets) -> Result<()> {
+async fn connect_and_serve(state: &AppState, secrets: &TwitchBotSecrets) -> Result<()> {
     info!(
         channel = %secrets.channel,
         username = %secrets.username,
@@ -72,47 +108,117 @@ async fn run_bot_inner(state: &AppState, secrets: TwitchBotSecrets) -> Result<()
         .await?;
 
     info!(channel = %secrets.channel, "twitch bot connected");
-    let mut rate_limiter = ChatRateLimiter::default();
 
-    while let Some(message) = reader.next().await {
-        let message = message.context("failed to read Twitch message")?;
+    let writer = Arc::new(Mutex::new(writer));
+    let rate_limiter = Arc::new(Mutex::new(ChatRateLimiter::default()));
+    let handlers = Arc::new(Semaphore::new(8));
 
-        let Message::Text(text) = message else {
-            continue;
-        };
+    // Watchdog: if no traffic arrives for a while (socket open but dead),
+    // force a reconnect. Keepalive PING keeps both directions active and
+    // surfaces a broken send path (error -> reconnect).
+    let mut idle_watchdog = Box::pin(tokio::time::sleep(READ_IDLE_TIMEOUT));
+    let mut keepalive = interval(KEEPALIVE_INTERVAL);
 
-        for line in text.lines() {
-            if line.starts_with("PING ") {
-                let response = line.replacen("PING", "PONG", 1);
-                writer.send(Message::Text(response.into())).await?;
-                continue;
+    loop {
+        tokio::select! {
+            message = reader.next() => {
+                let message = match message {
+                    Some(Ok(message)) => message,
+                    Some(Err(error)) => {
+                        return Err(error).context("failed to read Twitch message");
+                    }
+                    None => return Ok(()),
+                };
+                idle_watchdog = Box::pin(tokio::time::sleep(READ_IDLE_TIMEOUT));
+
+                let Message::Text(text) = message else {
+                    continue;
+                };
+
+                for line in text.lines() {
+                    if line.starts_with("PING ") {
+                        // PONG must never wait behind slow command handlers, or Twitch
+                        // will close the socket. Answer it immediately.
+                        let response = line.replacen("PING", "PONG", 1);
+                        send_with_timeout(&writer, Message::Text(response.into())).await?;
+                        continue;
+                    }
+
+                    let Some(privmsg) = Privmsg::parse(line) else {
+                        continue;
+                    };
+
+                    // Handle each command in its own task so a slow handler (YouTube
+                    // search, Spotify API, ...) cannot stall the read loop and PONGs.
+                    let Ok(permit) = handlers.clone().try_acquire_owned() else {
+                        continue;
+                    };
+                    let state = state.clone();
+                    let channel = secrets.channel.clone();
+                    let writer = writer.clone();
+                    let rate_limiter = rate_limiter.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let result = timeout(
+                            HANDLER_TIMEOUT,
+                            handle_privmsg(&state, privmsg, &rate_limiter),
+                        )
+                        .await;
+                        let reply = match result {
+                            Ok(Some(reply)) => reply,
+                            Ok(None) => return,
+                            Err(_) => {
+                                state
+                                    .record_event(
+                                        "error",
+                                        "команда перервана за таймаут",
+                                    )
+                                    .await;
+                                return;
+                            }
+                        };
+                        let reply = format!(
+                            "PRIVMSG #{} :{}",
+                            channel,
+                            sanitize_irc_reply(&reply)
+                        );
+                        let _ =
+                            send_with_timeout(&writer, Message::Text(reply.into())).await;
+                    });
+                }
             }
-
-            let Some(privmsg) = Privmsg::parse(line) else {
-                continue;
-            };
-
-            let Some(reply) = handle_privmsg(state, privmsg, &mut rate_limiter).await else {
-                continue;
-            };
-
-            let reply = format!(
-                "PRIVMSG #{} :{}",
-                secrets.channel,
-                sanitize_irc_reply(&reply)
-            );
-            writer.send(Message::Text(reply.into())).await?;
+            _ = &mut idle_watchdog => {
+                anyhow::bail!("no Twitch messages within {READ_IDLE_TIMEOUT:?}; forcing reconnect");
+            }
+            _ = keepalive.tick() => {
+                // A failed PING means the send path is gone too -> reconnect.
+                send_with_timeout(
+                    &writer,
+                    Message::Text("PING :tmi.twitch.tv".into()),
+                )
+                .await?;
+            }
         }
     }
+}
 
-    warn!("twitch websocket closed");
+/// Send a Twitch IRC message with a hard timeout so a blocked socket can
+/// never pin the shared writer lock.
+async fn send_with_timeout<S>(writer: &Arc<Mutex<S>>, message: Message) -> Result<()>
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    let mut guard = writer.lock().await;
+    timeout(SEND_TIMEOUT, guard.send(message))
+        .await
+        .map_err(|_| anyhow!("timed out sending Twitch message"))??;
     Ok(())
 }
 
 async fn handle_privmsg(
     state: &AppState,
     privmsg: Privmsg,
-    rate_limiter: &mut ChatRateLimiter,
+    rate_limiter: &Arc<Mutex<ChatRateLimiter>>,
 ) -> Option<String> {
     let settings = config::command_settings(&state.config.paths);
     let command = parse_chat_command(
@@ -136,7 +242,13 @@ async fn handle_privmsg(
             .await;
     }
 
-    if let Some(reply) = rate_limiter.check(&privmsg, &command) {
+    if let Some(reply) = {
+        // Rate-limiter lock is only held for this synchronous check, never
+        // across the heavy command body below, so one slow command cannot
+        // freeze the limiter for everyone else.
+        let mut limiter = rate_limiter.lock().await;
+        limiter.check(&privmsg, &command)
+    } {
         state.record_event("chat", reply.clone()).await;
         return Some(reply);
     }
@@ -153,10 +265,23 @@ async fn handle_privmsg(
                             format!("{} pediu {}", request.requester, display_title),
                         )
                         .await;
-                    Some(format!("@{requester} pedido adicionado: {display_title}"))
+                    request_flow::sync_backup_queue(state).await;
+                    save_queue_if_enabled(state).await;
+                    let queue = state.queue.read().await;
+                    let position = queue.position_of(request.id);
+                    drop(queue);
+                    match position {
+                        Some(1) => Some(format!(
+                            "@{requester} запит додано: {display_title}. Зараз грає."
+                        )),
+                        Some(pos) => Some(format!(
+                            "@{requester} запит додано: {display_title}. Позиція: #{pos}."
+                        )),
+                        None => Some(format!("@{requester} запит додано: {display_title}.")),
+                    }
                 }
                 Err(error) => {
-                    let message = format!("@{requester} nao consegui adicionar: {error}");
+                    let message = format!("@{requester} не вдалося додати: {error}");
                     state.record_event("error", message.clone()).await;
                     Some(message)
                 }
@@ -174,10 +299,7 @@ async fn handle_privmsg(
         ChatCommand::Volume { requester, level } => {
             Some(volume_reply(state, requester, level).await)
         }
-        ChatCommand::Help => Some(format!(
-            "Comandos: {}.",
-            help_commands(&settings).join(", ")
-        )),
+        ChatCommand::Help => Some(format!("Команди: {}.", help_commands(&settings).join(", "))),
         ChatCommand::AccessDenied {
             requester,
             command,
@@ -213,7 +335,7 @@ impl ChatRateLimiter {
         let user = privmsg.sender.to_ascii_lowercase();
         if Self::is_limited(&mut self.last_command, &user, now, Duration::from_secs(2)) {
             return Some(format!(
-                "@{} aguarde alguns segundos antes de usar outro comando.",
+                "@{} зачекай кілька секунд перед наступною командою.",
                 privmsg.sender
             ));
         }
@@ -227,7 +349,7 @@ impl ChatRateLimiter {
                     Duration::from_secs(10),
                 ) {
                     return Some(format!(
-                        "@{} aguarde alguns segundos antes de pedir outra musica.",
+                        "@{} зачекай кілька секунд перед наступною піснею.",
                         privmsg.sender
                     ));
                 }
@@ -236,7 +358,7 @@ impl ChatRateLimiter {
                 if Self::is_limited(&mut self.last_remove, &user, now, Duration::from_secs(5)) =>
             {
                 return Some(format!(
-                    "@{} aguarde alguns segundos antes de remover de novo.",
+                    "@{} зачекай кілька секунд перед повторним видаленням.",
                     privmsg.sender
                 ));
             }
@@ -290,14 +412,14 @@ async fn remove_last_request_reply(state: &AppState, requester: String) -> Strin
                 song.source,
                 crate::song_requests::RequestSource::Spotify { .. }
             ) {
-                " Se ela ja entrou na fila interna do Spotify, use skip quando chegar."
+                " Якщо вона вже у внутрішній черзі Spotify, пропусти її командою skip, коли дійде."
             } else {
                 ""
             };
             let title = display::chat_song_title(&song);
-            format!("@{requester} removi seu ultimo pedido: {title}.{suffix}")
+            format!("@{requester} прибрав твій останній запит: {title}.{suffix}")
         }
-        None => format!("@{requester} nao encontrei pedido seu pendente para remover."),
+        None => format!("@{requester} не знайшов тві запит у черзі для видалення."),
     };
     state.record_event("request", message.clone()).await;
     message
@@ -329,10 +451,10 @@ async fn skip_reply(state: &AppState, requester: String) -> String {
     save_queue_if_enabled(state).await;
     let message = match current_song {
         Some(song) => format!(
-            "@{requester} skip feito. Agora: {}",
+            "@{requester} пропустив. Зараз: {}",
             display::chat_song_title(&song)
         ),
-        None => format!("@{requester} skip feito. Fila vazia."),
+        None => format!("@{requester} пропустив. Черга порожня."),
     };
     state.record_event("player", message.clone()).await;
     message
@@ -342,39 +464,39 @@ async fn pear_skip_reply(state: &AppState, requester: &str) -> String {
     match crate::pear::skip_next(&state.config).await {
         Ok(outcome) if outcome.changed => {
             let suffix = if outcome.fallback_used {
-                " usando fila interna"
+                " через внутрішню чергу"
             } else {
                 ""
             };
             match outcome.after {
-                Some(after) => format!("@{requester} pulei no Pear{suffix}. Agora: {after}."),
-                None => format!("@{requester} pulei no Pear{suffix}."),
+                Some(after) => format!("@{requester} пропустив у Pear{suffix}. Зараз: {after}."),
+                None => format!("@{requester} пропустив у Pear{suffix}."),
             }
         }
         Ok(outcome) => {
             let current = outcome
                 .after
                 .or(outcome.before)
-                .map(|song| format!(" Musica atual: {song}."))
+                .map(|song| format!(" Поточна пісня: {song}."))
                 .unwrap_or_default();
-            format!("@{requester} enviei skip ao Pear, mas a musica nao mudou.{current}")
+            format!("@{requester} відправив skip у Pear, але пісня не змінилася.{current}")
         }
-        Err(error) => format!("@{requester} nao consegui pular no Pear: {error}"),
+        Err(error) => format!("@{requester} не вдалося пропустити у Pear: {error}"),
     }
 }
 
 fn help_commands(settings: &crate::commands::CommandSettings) -> Vec<String> {
     let aliases = &settings.aliases;
     vec![
-        format!("{} nome/link", aliases.song_request[0]),
+        format!("{} назва/посилання", aliases.song_request[0]),
         aliases.current_song[0].clone(),
         aliases.queue[0].clone(),
         aliases.remove[0].clone(),
         aliases.volume[0].clone(),
-        format!("{} 30 mod", aliases.volume[0]),
-        format!("{} mod", aliases.play[0]),
-        format!("{} mod", aliases.pause[0]),
-        format!("{} mod", aliases.skip[0]),
+        format!("{} 30 (мод)", aliases.volume[0]),
+        format!("{} (мод)", aliases.play[0]),
+        format!("{} (мод)", aliases.pause[0]),
+        format!("{} (мод)", aliases.skip[0]),
     ]
 }
 
@@ -395,12 +517,12 @@ async fn playback_reply(state: &AppState, requester: String, action: PlaybackAct
     {
         let message = match action {
             PlaybackAction::Play => match crate::pear::play(&state.config).await {
-                Ok(()) => format!("@{requester} Pear retomado."),
-                Err(error) => format!("@{requester} nao consegui controlar o Pear: {error}"),
+                Ok(()) => format!("@{requester} Pear відновлено."),
+                Err(error) => format!("@{requester} не вдалося керувати Pear: {error}"),
             },
             PlaybackAction::Pause => match crate::pear::pause(&state.config).await {
-                Ok(()) => format!("@{requester} Pear pausado."),
-                Err(error) => format!("@{requester} nao consegui controlar o Pear: {error}"),
+                Ok(()) => format!("@{requester} Pear на паузі."),
+                Err(error) => format!("@{requester} не вдалося керувати Pear: {error}"),
             },
             PlaybackAction::Next => pear_skip_reply(state, &requester).await,
         };
@@ -410,7 +532,7 @@ async fn playback_reply(state: &AppState, requester: String, action: PlaybackAct
 
     let message = spotify_playback_reply(state, requester, action)
         .await
-        .unwrap_or_else(|| "Spotify nao conectado.".to_string());
+        .unwrap_or_else(|| "Spotify не підключено.".to_string());
     state.record_event("player", message.clone()).await;
     message
 }
@@ -431,12 +553,44 @@ async fn spotify_playback_reply(
 
     Some(match result {
         Ok(()) => match action {
-            PlaybackAction::Play => format!("@{requester} playback retomado."),
-            PlaybackAction::Pause => format!("@{requester} playback pausado."),
-            PlaybackAction::Next => format!("@{requester} pulei para a proxima."),
+            PlaybackAction::Play => format!("@{requester} відтворення відновлено."),
+            PlaybackAction::Pause => format!("@{requester} відтворення на паузі."),
+            PlaybackAction::Next => format!("@{requester} пропустив на наступну."),
         },
-        Err(error) => format!("@{requester} nao consegui controlar o Spotify: {error}"),
+        Err(error) => format!("@{requester} не вдалося керувати Spotify: {error}"),
     })
+}
+
+/// Human label for the backup track currently in the queue: real title/artist
+/// from the YouTube Data API (cached in AppState), falling back to "Бекап N".
+async fn backup_track_label(state: &AppState) -> Option<String> {
+    let (url, title) = {
+        let queue = state.queue.read().await;
+        let song = queue
+            .view()
+            .current_song
+            .filter(|song| matches!(song.source, RequestSource::Backup))?;
+        (song.query.clone(), song.title.clone())
+    };
+    let video_id = youtube::YoutubeVideoRef::parse(&url)?.video_id;
+
+    {
+        let cache = state.video_meta_cache.lock().await;
+        if let Some((title, artist)) = cache.get(&video_id) {
+            return Some(format!("{title} — {artist}"));
+        }
+    }
+
+    if let Some((title, artist)) = youtube::video_title_artist(&state.config, &video_id).await {
+        state
+            .video_meta_cache
+            .lock()
+            .await
+            .insert(video_id.clone(), (title.clone(), artist.clone()));
+        return Some(format!("{title} — {artist}"));
+    }
+
+    Some(title)
 }
 
 async fn current_song_reply(state: &AppState) -> String {
@@ -444,7 +598,7 @@ async fn current_song_reply(state: &AppState) -> String {
         MusicProvider::Spotify => {
             if let Some(snapshot) = spotify_queue_snapshot(state).await {
                 if let Some(song) = snapshot.currently_playing {
-                    return format!("Tocando agora: {song}");
+                    return format!("Зараз грає: {song}");
                 }
             }
         }
@@ -453,7 +607,7 @@ async fn current_song_reply(state: &AppState) -> String {
         {
             if let Ok(Some(song)) = crate::pear::now_playing_request(&state.config).await {
                 return format!(
-                    "Tocando agora: {} - pedido por {}",
+                    "Зараз грає: {} — запит від {}",
                     display::chat_song_title(&song),
                     song.requester
                 );
@@ -465,11 +619,17 @@ async fn current_song_reply(state: &AppState) -> String {
     let queue = active_app_queue_view(state).await;
     match queue.current_song {
         Some(song) => format!(
-            "Tocando agora: {} - pedido por {}",
+            "Зараз грає: {} — запит від {}",
             display::chat_song_title(&song),
             song.requester
         ),
-        None => "Nenhuma musica tocando agora.".to_string(),
+        None => {
+            if let Some(label) = backup_track_label(state).await {
+                format!("Зараз грає: {label} — бекап-черга")
+            } else {
+                "Зараз нічого не грає.".to_string()
+            }
+        }
     }
 }
 
@@ -485,11 +645,11 @@ async fn queue_reply(state: &AppState) -> String {
             if snapshot.upcoming.is_empty() {
                 return snapshot
                     .currently_playing
-                    .map(|song| format!("Tocando agora: {song}. Fila vazia."))
-                    .unwrap_or_else(|| "Fila vazia.".to_string());
+                    .map(|song| format!("Зараз грає: {song}. Черга порожня."))
+                    .unwrap_or_else(|| "Черга порожня.".to_string());
             }
 
-            return format!("Proximas: {}", snapshot.upcoming.join(" | "));
+            return format!("Далі: {}", snapshot.upcoming.join(" | "));
         }
     }
 
@@ -513,18 +673,15 @@ async fn pear_queue_reply(state: &AppState) -> String {
 
             match (current, upcoming.is_empty()) {
                 (Some(current), false) => {
-                    format!(
-                        "Pear tocando: {current}. Proximas: {}",
-                        upcoming.join(" | ")
-                    )
+                    format!("Pear грає: {current}. Далі: {}", upcoming.join(" | "))
                 }
-                (Some(current), true) => format!("Pear tocando: {current}. Sem proximas no Pear."),
-                (None, false) => format!("Pear proximas: {}", upcoming.join(" | ")),
+                (Some(current), true) => format!("Pear грає: {current}. Далі в Pear порожньо."),
+                (None, false) => format!("У Pear далі: {}", upcoming.join(" | ")),
                 (None, true) => app_queue_reply(state).await,
             }
         }
         Ok(_) => app_queue_reply(state).await,
-        Err(error) => format!("Nao consegui ler a fila do Pear: {error}"),
+        Err(error) => format!("Не вдалося прочитати чергу Pear: {error}"),
     }
 }
 
@@ -539,7 +696,7 @@ async fn app_queue_reply(state: &AppState) -> String {
     let queue = active_app_queue_view(state).await;
     let current = queue.current_song.map(|song| {
         format!(
-            "Tocando agora: {} por {}",
+            "Зараз грає: {} — запит від {}",
             display::chat_song_title(&song),
             song.requester
         )
@@ -548,14 +705,20 @@ async fn app_queue_reply(state: &AppState) -> String {
         .queue
         .into_iter()
         .take(5)
-        .map(|song| format!("{} por {}", display::chat_song_title(&song), song.requester))
+        .map(|song| {
+            format!(
+                "{} — запит від {}",
+                display::chat_song_title(&song),
+                song.requester
+            )
+        })
         .collect::<Vec<_>>();
 
     match (current, upcoming.is_empty()) {
-        (Some(current), false) => format!("{current}. Proximas: {}", upcoming.join(" | ")),
-        (Some(current), true) => format!("{current}. Fila vazia."),
-        (None, false) => format!("Proximas: {}", upcoming.join(" | ")),
-        (None, true) => "Fila vazia.".to_string(),
+        (Some(current), false) => format!("{current}. Далі: {}", upcoming.join(" | ")),
+        (Some(current), true) => format!("{current}. Черга порожня."),
+        (None, false) => format!("Далі: {}", upcoming.join(" | ")),
+        (None, true) => "Черга порожня.".to_string(),
     }
 }
 
@@ -598,19 +761,19 @@ async fn volume_reply(state: &AppState, requester: String, level: Option<u8>) ->
                         changed.push(format!("Spotify {level}%"));
                     }
                     Some(Err(error)) => errors.push(format!("Spotify: {error}")),
-                    None => errors.push("Spotify nao conectado".to_string()),
+                    None => errors.push("Spotify не підключено".to_string()),
                 },
             }
 
             if !changed.is_empty() {
-                let message = format!("@{requester} volume ajustado: {}.", changed.join(", "));
+                let message = format!("@{requester} гучність змінено: {}.", changed.join(", "));
                 state.record_event("volume", message.clone()).await;
                 if !errors.is_empty() {
                     state
                         .record_event(
                             "volume",
                             format!(
-                                "Volume parcial: {}. Falhas: {}",
+                                "Гучність змінено частково: {}. Помилки: {}",
                                 changed.join(", "),
                                 errors.join(" | ")
                             ),
@@ -620,7 +783,7 @@ async fn volume_reply(state: &AppState, requester: String, level: Option<u8>) ->
                 message
             } else {
                 let message = format!(
-                    "@{requester} nao consegui mudar volume: {}",
+                    "@{requester} не вдалося змінити гучність: {}",
                     errors.join(" | ")
                 );
                 state.record_event("error", message.clone()).await;
@@ -672,10 +835,14 @@ async fn current_volume_reply(state: &AppState) -> String {
     ) {
         return match crate::pear::current_volume(&state.config).await {
             Ok(volume) => {
-                let suffix = if volume.is_muted { " (mutado)" } else { "" };
-                format!("Volume atual Pear/YouTube: {}%{suffix}.", volume.state)
+                let suffix = if volume.is_muted {
+                    " (вимкнено)"
+                } else {
+                    ""
+                };
+                format!("Поточна гучність Pear/YouTube: {}%{suffix}.", volume.state)
             }
-            Err(error) => format!("Nao consegui ler o volume Pear/YouTube: {error}"),
+            Err(error) => format!("Не вдалося прочитати гучність Pear/YouTube: {error}"),
         };
     }
 
@@ -685,19 +852,19 @@ async fn current_volume_reply(state: &AppState) -> String {
             .load(Ordering::SeqCst)
             .clamp(1, 100);
         return format!(
-            "Volume atual OBS Browser: {level}%. O fader do OBS continua separado no mixer."
+            "Поточна гучність OBS Browser: {level}%. Фейдер OBS залишається окремим у мікшері."
         );
     }
 
     let mut token_guard = state.spotify_token.write().await;
     let Some(token) = token_guard.as_mut() else {
-        return "Spotify nao conectado.".to_string();
+        return "Spotify не підключено.".to_string();
     };
 
     match crate::spotify::current_volume(&state.config, token).await {
-        Ok(Some(level)) => format!("Volume atual Spotify: {level}%."),
-        Ok(None) => "Nao encontrei um device Spotify ativo para ler o volume.".to_string(),
-        Err(error) => format!("Nao consegui ler o volume Spotify: {error}"),
+        Ok(Some(level)) => format!("Поточна гучність Spotify: {level}%."),
+        Ok(None) => "Не знайшов активний пристрій Spotify для зчитування гучності.".to_string(),
+        Err(error) => format!("Не вдалося прочитати гучність Spotify: {error}"),
     }
 }
 
@@ -798,7 +965,30 @@ async fn save_queue_if_enabled(state: &AppState) {
 }
 
 async fn local_browser_skip_reply(state: &AppState, requester: &str) -> String {
-    state.youtube_browser_paused.store(false, Ordering::SeqCst);
+    state.set_browser_paused(false);
+
+    let current_backup = {
+        let queue = state.queue.read().await;
+        queue.is_current_backup()
+    };
+
+    if current_backup {
+        // Backup entries are part of the queue, but their id is a playlist
+        // cursor: skipping one means advancing the playlist and resyncing.
+        state.advance_and_sync(&state.config.paths).await;
+        state
+            .record_event(
+                "player",
+                "Бекап-трек пропущено з чату; наступний з бекап-списку",
+            )
+            .await;
+
+        if let Some(label) = current_song_reply(state).await.strip_prefix("Зараз грає: ") {
+            return format!("@{requester} пропустив. Зараз: {label}");
+        }
+        return format!("@{requester} пропустив. Черга порожня.");
+    }
+
     let current_id = filtered_app_queue_view(
         state,
         MusicProvider::Youtube,
@@ -808,28 +998,27 @@ async fn local_browser_skip_reply(state: &AppState, requester: &str) -> String {
     .current_song
     .map(|song| song.id);
 
-    let current_song = if let Some(id) = current_id {
+    if let Some(id) = current_id {
         let mut queue = state.queue.write().await;
         queue.remove_by_id(id);
         drop(queue);
         save_queue_if_enabled(state).await;
-        filtered_app_queue_view(
-            state,
-            MusicProvider::Youtube,
-            Some(YoutubeRequestPlayback::Browser),
-        )
-        .await
-        .current_song
-    } else {
-        None
-    };
+    }
+
+    let current_song = filtered_app_queue_view(
+        state,
+        MusicProvider::Youtube,
+        Some(YoutubeRequestPlayback::Browser),
+    )
+    .await
+    .current_song;
 
     match current_song {
         Some(song) => format!(
-            "@{requester} skip feito. Agora: {}",
+            "@{requester} пропустив. Зараз: {}",
             display::chat_song_title(&song)
         ),
-        None => format!("@{requester} skip feito. Fila vazia."),
+        None => format!("@{requester} пропустив. Черга порожня."),
     }
 }
 
@@ -840,16 +1029,16 @@ fn local_browser_playback_reply(
 ) -> String {
     match action {
         PlaybackAction::Play => {
-            state.youtube_browser_paused.store(false, Ordering::SeqCst);
-            format!("@{requester} player OBS retomado.")
+            state.set_browser_paused(false);
+            format!("@{requester} OBS-плеєр відновлено.")
         }
         PlaybackAction::Pause => {
-            state.youtube_browser_paused.store(true, Ordering::SeqCst);
-            format!("@{requester} player OBS pausado.")
+            state.set_browser_paused(true);
+            format!("@{requester} OBS-плеєр на паузі.")
         }
         PlaybackAction::Next => {
-            state.youtube_browser_paused.store(false, Ordering::SeqCst);
-            format!("@{requester} pulando player OBS.")
+            state.set_browser_paused(false);
+            format!("@{requester} пропускаю в OBS-плеєрі.")
         }
     }
 }
@@ -861,19 +1050,19 @@ fn access_denied_reply(
 ) -> String {
     match required {
         crate::commands::CommandAccess::Follower => {
-            format!("@{requester} {command} precisa seguir o canal.")
+            format!("@{requester} {command} потребує підписки на канал.")
         }
         crate::commands::CommandAccess::Subscriber => {
-            format!("@{requester} {command} precisa de sub, VIP, moderador ou streamer.")
+            format!("@{requester} {command} потребує саба, VIP, модератора або стрімера.")
         }
         crate::commands::CommandAccess::Vip => {
-            format!("@{requester} {command} precisa de VIP, moderador ou streamer.")
+            format!("@{requester} {command} потребує VIP, модератора або стрімера.")
         }
         crate::commands::CommandAccess::Moderator => {
-            format!("@{requester} {command} precisa de moderador ou streamer.")
+            format!("@{requester} {command} потребує модератора або стрімера.")
         }
         crate::commands::CommandAccess::Streamer => {
-            format!("@{requester} {command} precisa do streamer.")
+            format!("@{requester} {command} потребує стрімера.")
         }
     }
 }
@@ -1001,8 +1190,8 @@ mod tests {
 
         let reply = app_queue_reply(&state).await;
 
-        assert!(reply.contains("Tocando agora: Current Artist - Current Song por viewer"));
-        assert!(reply.contains("Proximas: Next Artist - Next Song por mod"));
+        assert!(reply.contains("Зараз грає: Current Artist - Current Song — запит від viewer"));
+        assert!(reply.contains("Далі: Next Artist - Next Song — запит від mod"));
     }
 
     #[test]
